@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"os"
 
-	"github.com/cloudfoundry-incubator/bbs"
 	"github.com/cloudfoundry-incubator/cf-debug-server"
 	"github.com/cloudfoundry-incubator/cf-lager"
 	"github.com/cloudfoundry-incubator/consuladapter"
@@ -24,18 +23,15 @@ import (
 	"github.com/tedsuo/ifrit/grouper"
 	"github.com/tedsuo/ifrit/http_server"
 	"github.com/tedsuo/ifrit/sigmon"
+
+	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_3"
+	"k8s.io/kubernetes/pkg/client/restclient"
 )
 
 var listenAddr = flag.String(
 	"listenAddr",
 	"0.0.0.0:1518", // p and s's offset in the alphabet, do not change
 	"listening address of api server",
-)
-
-var bbsAddress = flag.String(
-	"bbsAddress",
-	"",
-	"Address to the BBS Server",
 )
 
 var dropsondePort = flag.Int(
@@ -62,34 +58,28 @@ var maxInFlightRequests = flag.Int(
 	"number of requests to handle at a time; any more will receive 503",
 )
 
-var bbsCACert = flag.String(
-	"bbsCACert",
+var kubeCluster = flag.String(
+	"kubeCluster",
 	"",
-	"path to certificate authority cert used for mutually authenticated TLS BBS communication",
+	"kubernetes API server URL (scheme://ip:port)",
 )
 
-var bbsClientCert = flag.String(
-	"bbsClientCert",
+var kubeCACert = flag.String(
+	"kubeCACert",
 	"",
-	"path to client cert used for mutually authenticated TLS BBS communication",
+	"path to kubernetes API server CA certificate",
 )
 
-var bbsClientKey = flag.String(
-	"bbsClientKey",
+var kubeClientCert = flag.String(
+	"kubeClientCert",
 	"",
-	"path to client key used for mutually authenticated TLS BBS communication",
+	"path to client certificate for authentication with the kubernetes API server",
 )
 
-var bbsClientSessionCacheSize = flag.Int(
-	"bbsClientSessionCacheSize",
-	0,
-	"Capacity of the ClientSessionCache option on the TLS configuration. If zero, golang's default will be used",
-)
-
-var bbsMaxIdleConnsPerHost = flag.Int(
-	"bbsMaxIdleConnsPerHost",
-	0,
-	"Controls the maximum number of idle (keep-alive) connctions per host. If zero, golang's default will be used",
+var kubeClientKey = flag.String(
+	"kubeClientKey",
+	"",
+	"path to client key for authentication with the kubernetes API server",
 )
 
 var bulkLRPStatusWorkers = flag.Int(
@@ -117,7 +107,7 @@ func main() {
 	initializeDropsonde(logger)
 	noaaClient := consumer.New(*trafficControllerURL, &tls.Config{InsecureSkipVerify: *skipSSLVerification}, nil)
 	defer noaaClient.Close()
-	apiHandler := initializeHandler(logger, noaaClient, *maxInFlightRequests, initializeBBSClient(logger))
+	apiHandler := initializeHandler(logger, noaaClient, *maxInFlightRequests, initializeK8sClient(logger).Core())
 
 	consulClient, err := consuladapter.NewClientFromUrl(*consulCluster)
 	if err != nil {
@@ -160,30 +150,13 @@ func initializeDropsonde(logger lager.Logger) {
 	}
 }
 
-func initializeHandler(logger lager.Logger, noaaClient *consumer.Consumer, maxInFlight int, apiClient bbs.Client) http.Handler {
+func initializeHandler(logger lager.Logger, noaaClient *consumer.Consumer, maxInFlight int, apiClient clientset.Interface) http.Handler {
 	apiHandler, err := handler.New(apiClient, noaaClient, maxInFlight, *bulkLRPStatusWorkers, logger)
 	if err != nil {
 		logger.Fatal("initialize-handler.failed", err)
 	}
 
 	return apiHandler
-}
-
-func initializeBBSClient(logger lager.Logger) bbs.Client {
-	bbsURL, err := url.Parse(*bbsAddress)
-	if err != nil {
-		logger.Fatal("Invalid BBS URL", err)
-	}
-
-	if bbsURL.Scheme != "https" {
-		return bbs.NewClient(*bbsAddress)
-	}
-
-	bbsClient, err := bbs.NewSecureClient(*bbsAddress, *bbsCACert, *bbsClientCert, *bbsClientKey, *bbsClientSessionCacheSize, *bbsMaxIdleConnsPerHost)
-	if err != nil {
-		logger.Fatal("Failed to configure secure BBS client", err)
-	}
-	return bbsClient
 }
 
 func initializeRegistrationRunner(logger lager.Logger, consulClient consuladapter.Client, listenAddress string, clock clock.Clock) ifrit.Runner {
@@ -205,4 +178,21 @@ func initializeRegistrationRunner(logger lager.Logger, consulClient consuladapte
 	}
 
 	return locket.NewRegistrationRunner(logger, registration, consulClient, locket.RetryInterval, clock)
+}
+
+func initializeK8sClient(logger lager.Logger) clientset.Interface {
+	k8sClient, err := clientset.NewForConfig(&restclient.Config{
+		Host: *kubeCluster,
+		TLSClientConfig: restclient.TLSClientConfig{
+			CertFile: *kubeClientCert,
+			KeyFile:  *kubeClientKey,
+			CAFile:   *kubeCACert,
+		},
+	})
+
+	if err != nil {
+		logger.Fatal("Can't create Kubernetes Client", err, lager.Data{"address": *kubeCluster})
+	}
+
+	return k8sClient
 }
