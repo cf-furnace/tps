@@ -5,13 +5,17 @@ import (
 	"net/http/httptest"
 	"sync"
 
-	"github.com/cloudfoundry-incubator/bbs/fake_bbs"
-	"github.com/cloudfoundry-incubator/bbs/models"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/api/v1"
+
+	"github.com/cloudfoundry-incubator/nsync/helpers"
+	"github.com/cloudfoundry-incubator/runtime-schema/cc_messages"
 	"github.com/cloudfoundry-incubator/tps/handler"
+	handlerfakes "github.com/cloudfoundry-incubator/tps/handler/handler_fakes"
 	"github.com/cloudfoundry-incubator/tps/handler/lrpstats/fakes"
 	"github.com/cloudfoundry/sonde-go/events"
 	"github.com/gogo/protobuf/proto"
-	"github.com/pivotal-golang/lager"
 	"github.com/pivotal-golang/lager/lagertest"
 
 	. "github.com/onsi/ginkgo"
@@ -23,16 +27,18 @@ var _ = Describe("Handler", func() {
 	Describe("rate limiting", func() {
 
 		var (
-			noaaClient *fakes.FakeNoaaClient
-			bbsClient  *fake_bbs.FakeClient
+			noaaClient     *fakes.FakeNoaaClient
+			fakeKubeClient *handlerfakes.FakeKubeClient
 
 			logger *lagertest.TestLogger
 
 			server                 *httptest.Server
-			fakeActualLRPResponses chan []*models.ActualLRPGroup
+			fakeActualLRPResponses chan *v1.PodList
 			statsRequest           *http.Request
 			statusRequest          *http.Request
 			httpClient             *http.Client
+			fakePod                *handlerfakes.FakePod
+			pod                    *v1.Pod
 		)
 
 		BeforeEach(func() {
@@ -41,23 +47,77 @@ var _ = Describe("Handler", func() {
 
 			httpClient = &http.Client{}
 			logger = lagertest.NewTestLogger("test")
-			bbsClient = new(fake_bbs.FakeClient)
+			fakeKubeClient = &handlerfakes.FakeKubeClient{}
 			noaaClient = &fakes.FakeNoaaClient{}
 
-			httpHandler, err = handler.New(bbsClient, noaaClient, 2, 15, logger)
+			httpHandler, err = handler.New(fakeKubeClient, noaaClient, 2, 15, logger)
 			Expect(err).NotTo(HaveOccurred())
 
 			server = httptest.NewServer(httpHandler)
+			processGuid, err := helpers.NewProcessGuid("8d58c09b-b305-4f16-bcfe-b78edcb77100-3f258eb0-9dac-460c-a424-b43fe92bee27")
+			Expect(err).NotTo(HaveOccurred())
 
-			fakeActualLRPResponses = make(chan []*models.ActualLRPGroup, 2)
+			fakeActualLRPResponses = make(chan *v1.PodList, 2)
+			statsRequest, err = http.NewRequest("GET", server.URL+"/v1/actual_lrps/"+processGuid.String()+"/stats", nil)
+			Expect(err).NotTo(HaveOccurred())
+			statsRequest.Header.Set("Authorization", "something")
 
-			bbsClient.DesiredLRPByProcessGuidStub = func(lager.Logger, string) (*models.DesiredLRP, error) {
-				return &models.DesiredLRP{}, nil
+			statusRequest, err = http.NewRequest("GET", server.URL+"/v1/actual_lrps/"+processGuid.String(), nil)
+			Expect(err).NotTo(HaveOccurred())
+
+			fakePod = &handlerfakes.FakePod{}
+
+			now := unversioned.Now()
+			pod = &v1.Pod{
+				ObjectMeta: v1.ObjectMeta{
+					Name:              "pod-name",
+					Namespace:         "namespace",
+					UID:               "1234-5677",
+					CreationTimestamp: now,
+					Labels: map[string]string{
+						"cloudfoundry.org/app-guid":     processGuid.AppGuid.String(),
+						"cloudfoundry.org/space-guid":   "my-space-id",
+						"cloudfoundry.org/process-guid": processGuid.ShortenedGuid(),
+						"cloudfoundry.org/domain":       cc_messages.AppLRPDomain,
+					},
+					Annotations: map[string]string{
+						"cloudfoundry.org/log-guid": "my-log-guid",
+					},
+				},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						v1.Container{
+							Name:  "application",
+							Image: "cloudfoundry/cflinuxfs2:latest",
+						},
+					},
+				},
+				Status: v1.PodStatus{
+					StartTime: &now,
+					ContainerStatuses: []v1.ContainerStatus{
+						v1.ContainerStatus{
+							Name: "application",
+							State: v1.ContainerState{
+								Running: &v1.ContainerStateRunning{},
+							},
+							Ready:        true,
+							RestartCount: int32(0),
+						},
+					},
+				},
 			}
 
-			bbsClient.ActualLRPGroupsByProcessGuidStub = func(lager.Logger, string) ([]*models.ActualLRPGroup, error) {
+			fakeKubeClient.PodsReturns(fakePod)
+			fakePod.ListReturns(&v1.PodList{
+				Items: []v1.Pod{*pod},
+			}, nil)
+
+			fakePod.ListStub = func(opts api.ListOptions) (*v1.PodList, error) {
 				return <-fakeActualLRPResponses, nil
 			}
+			// bbsClient.ActualLRPGroupsByProcessGuidStub = func(lager.Logger, string) ([]*models.ActualLRPGroup, error) {
+			// 	return <-fakeActualLRPResponses, nil
+			// }
 
 			noaaClient.ContainerMetricsReturns([]*events.ContainerMetric{
 				{
@@ -68,13 +128,6 @@ var _ = Describe("Handler", func() {
 					DiskBytes:     proto.Uint64(2048),
 				},
 			}, nil)
-
-			statsRequest, err = http.NewRequest("GET", server.URL+"/v1/actual_lrps/some-guid/stats", nil)
-			Expect(err).NotTo(HaveOccurred())
-			statsRequest.Header.Set("Authorization", "something")
-
-			statusRequest, err = http.NewRequest("GET", server.URL+"/v1/actual_lrps/some-guid", nil)
-			Expect(err).NotTo(HaveOccurred())
 		})
 
 		AfterEach(func() {
@@ -107,8 +160,8 @@ var _ = Describe("Handler", func() {
 				Expect(res.StatusCode).To(Equal(http.StatusOK))
 			}()
 
-			Eventually(bbsClient.ActualLRPGroupsByProcessGuidCallCount).Should(Equal(2))
-
+			//Eventually(bbsClient.ActualLRPGroupsByProcessGuidCallCount).Should(Equal(2))
+			Eventually(fakePod.ListCallCount).Should(Equal(2))
 			// hit it again, assert we get a 503
 			res, err := httpClient.Do(statusRequest)
 			Expect(err).NotTo(HaveOccurred())
@@ -119,8 +172,8 @@ var _ = Describe("Handler", func() {
 			Expect(res.StatusCode).To(Equal(http.StatusServiceUnavailable))
 
 			// un-hang http calls
-			fakeActualLRPResponses <- []*models.ActualLRPGroup{}
-			fakeActualLRPResponses <- []*models.ActualLRPGroup{}
+			fakeActualLRPResponses <- &v1.PodList{Items: []v1.Pod{*pod}}
+			fakeActualLRPResponses <- &v1.PodList{Items: []v1.Pod{*pod}}
 			wg.Wait()
 
 			// confirm we can request again
@@ -144,8 +197,8 @@ var _ = Describe("Handler", func() {
 				Expect(res.StatusCode).To(Equal(http.StatusOK))
 			}()
 
-			fakeActualLRPResponses <- []*models.ActualLRPGroup{}
-			fakeActualLRPResponses <- []*models.ActualLRPGroup{}
+			fakeActualLRPResponses <- &v1.PodList{Items: []v1.Pod{*pod}}
+			fakeActualLRPResponses <- &v1.PodList{Items: []v1.Pod{*pod}}
 			wg.Wait()
 
 		})

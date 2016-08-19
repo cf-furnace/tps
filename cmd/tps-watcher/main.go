@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 
+	"github.com/cloudfoundry-incubator/bbs"
 	"github.com/cloudfoundry-incubator/cf-debug-server"
 	"github.com/cloudfoundry-incubator/cf-lager"
 	"github.com/cloudfoundry-incubator/consuladapter"
@@ -20,9 +21,12 @@ import (
 	"github.com/tedsuo/ifrit"
 	"github.com/tedsuo/ifrit/grouper"
 	"github.com/tedsuo/ifrit/sigmon"
+)
 
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_3"
-	"k8s.io/kubernetes/pkg/client/restclient"
+var bbsAddress = flag.String(
+	"bbsAddress",
+	"",
+	"Address to the BBS Server",
 )
 
 var consulCluster = flag.String(
@@ -73,6 +77,36 @@ var skipCertVerify = flag.Bool(
 	"skip SSL certificate verification",
 )
 
+var bbsCACert = flag.String(
+	"bbsCACert",
+	"",
+	"path to certificate authority cert used for mutually authenticated TLS BBS communication",
+)
+
+var bbsClientCert = flag.String(
+	"bbsClientCert",
+	"",
+	"path to client cert used for mutually authenticated TLS BBS communication",
+)
+
+var bbsClientKey = flag.String(
+	"bbsClientKey",
+	"",
+	"path to client key used for mutually authenticated TLS BBS communication",
+)
+
+var bbsClientSessionCacheSize = flag.Int(
+	"bbsClientSessionCacheSize",
+	0,
+	"Capacity of the ClientSessionCache option on the TLS configuration. If zero, golang's default will be used",
+)
+
+var bbsMaxIdleConnsPerHost = flag.Int(
+	"bbsMaxIdleConnsPerHost",
+	0,
+	"Controls the maximum number of idle (keep-alive) connctions per host. If zero, golang's default will be used",
+)
+
 var eventHandlingWorkers = flag.Int(
 	"eventHandlingWorkers",
 	500,
@@ -100,7 +134,7 @@ func main() {
 		w, err := watcher.NewWatcher(logger,
 			*eventHandlingWorkers,
 			watcher.DefaultRetryPauseInterval,
-			initializeK8sClient(logger).Core(), ccClient)
+			initializeBBSClient(logger), ccClient)
 
 		if err != nil {
 			return err
@@ -163,19 +197,19 @@ func initializeLockMaintainer(logger lager.Logger) ifrit.Runner {
 	return serviceClient.NewTPSWatcherLockRunner(logger, uuid.String(), *lockRetryInterval, *lockTTL)
 }
 
-func initializeK8sClient(logger lager.Logger) clientset.Interface {
-	k8sClient, err := clientset.NewForConfig(&restclient.Config{
-		Host: *kubeCluster,
-		TLSClientConfig: restclient.TLSClientConfig{
-			CertFile: *kubeClientCert,
-			KeyFile:  *kubeClientKey,
-			CAFile:   *kubeCACert,
-		},
-	})
-
+func initializeBBSClient(logger lager.Logger) bbs.Client {
+	bbsURL, err := url.Parse(*bbsAddress)
 	if err != nil {
-		logger.Fatal("Can't create Kubernetes Client", err, lager.Data{"address": *kubeCluster})
+		logger.Fatal("Invalid BBS URL", err)
 	}
 
-	return k8sClient
+	if bbsURL.Scheme != "https" {
+		return bbs.NewClient(*bbsAddress)
+	}
+
+	bbsClient, err := bbs.NewSecureClient(*bbsAddress, *bbsCACert, *bbsClientCert, *bbsClientKey, *bbsClientSessionCacheSize, *bbsMaxIdleConnsPerHost)
+	if err != nil {
+		logger.Fatal("Failed to configure secure BBS client", err)
+	}
+	return bbsClient
 }

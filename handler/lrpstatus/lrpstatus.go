@@ -2,26 +2,30 @@ package lrpstatus
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
-	"github.com/cloudfoundry-incubator/bbs"
-	"github.com/cloudfoundry-incubator/bbs/models"
-	"github.com/cloudfoundry-incubator/tps/handler/cc_conv"
+	"github.com/cloudfoundry-incubator/nsync/helpers"
+	tpshelpers "github.com/cloudfoundry-incubator/tps/helpers"
 	"github.com/pivotal-golang/clock"
 	"github.com/pivotal-golang/lager"
 
 	"github.com/cloudfoundry-incubator/runtime-schema/cc_messages"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/v1"
+	v1core "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_3/typed/core/v1"
+	"k8s.io/kubernetes/pkg/labels"
 )
 
 type handler struct {
-	apiClient bbs.Client
+	k8sClient v1core.CoreInterface
 	clock     clock.Clock
 	logger    lager.Logger
 }
 
-func NewHandler(apiClient bbs.Client, clk clock.Clock, logger lager.Logger) http.Handler {
+func NewHandler(k8sClient v1core.CoreInterface, clk clock.Clock, logger lager.Logger) http.Handler {
 	return &handler{
-		apiClient: apiClient,
+		k8sClient: k8sClient,
 		clock:     clk,
 		logger:    logger,
 	}
@@ -32,20 +36,31 @@ func (handler *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	logger := handler.logger.Session("lrp-status", lager.Data{"process-guid": guid})
 
 	logger.Info("fetching-actual-lrp-info")
-	actualLRPGroups, err := handler.apiClient.ActualLRPGroupsByProcessGuid(logger, guid)
+
+	pg, err := helpers.NewProcessGuid(guid)
+	if err != nil {
+		logger.Error("invalid-process-guid", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	logger.Info("shortened-process-guid", lager.Data{"shortened-process-guid": pg.ShortenedGuid()})
+
+	actualPodsList, err := handler.k8sClient.Pods(api.NamespaceAll).List(api.ListOptions{
+		LabelSelector: labels.Set{"cloudfoundry.org/process-guid": pg.ShortenedGuid()}.AsSelector(),
+	})
+
 	if err != nil {
 		logger.Error("failed-fetching-actual-lrp-info", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	instances := LRPInstances(actualLRPGroups,
-		func(instance *cc_messages.LRPInstance, actual *models.ActualLRP) {
-			instance.Details = actual.PlacementError
-		},
+	instances := LRPInstances(actualPodsList.Items,
 		handler.clock,
 	)
 
+	logger.Debug("failed-fetching-actual-lrp-info-instances", lager.Data{"instances": instances})
 	err = json.NewEncoder(w).Encode(instances)
 	if err != nil {
 		logger.Error("stream-response-failed", err)
@@ -53,30 +68,64 @@ func (handler *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func LRPInstances(
-	actualLRPGroups []*models.ActualLRPGroup,
-	addInfo func(*cc_messages.LRPInstance, *models.ActualLRP),
+	actualPods []v1.Pod,
 	clk clock.Clock,
 ) []cc_messages.LRPInstance {
-	instances := make([]cc_messages.LRPInstance, len(actualLRPGroups))
-	for i, actualLRPGroup := range actualLRPGroups {
-		actual, _ := actualLRPGroup.Resolve()
+	instances := make([]cc_messages.LRPInstance, len(actualPods))
 
-		instance := cc_messages.LRPInstance{
-			ProcessGuid:  actual.ProcessGuid,
-			InstanceGuid: actual.InstanceGuid,
-			Index:        uint(actual.Index),
-			Since:        actual.Since / 1e9,
-			Uptime:       (clk.Now().UnixNano() - actual.Since) / 1e9,
-			State:        cc_conv.StateFor(actual.State, actual.PlacementError),
-			NetInfo:      actual.ActualLRPNetInfo,
+	j := 0
+
+	actualPods = tpshelpers.SortPods(actualPods)
+
+	for i, pod := range actualPods {
+		//actual, _ := actualLRPGroup.Resolve()
+		shortenedGuid := pod.ObjectMeta.Labels["cloudfoundry.org/process-guid"]
+		processGuid, err := helpers.DecodeProcessGuid(shortenedGuid)
+
+		if err != nil {
+			// ignore this LRPInstance
+			//logger.Error("error get process guid", err)
 		}
-
-		if addInfo != nil {
-			addInfo(&instance, actual)
+		instanceState := getApplicationContainerState(pod)
+		if instanceState != "" {
+			instance := cc_messages.LRPInstance{
+				ProcessGuid:  processGuid.String(), // TODO: convert it to full pg
+				InstanceGuid: string(pod.ObjectMeta.UID),
+				Index:        uint(i),
+				Since:        pod.Status.StartTime.UnixNano() / 1e9,
+				Uptime:       (clk.Now().UnixNano() - pod.Status.StartTime.UnixNano()) / 1e9,
+				State:        instanceState,
+			}
+			instances[j] = instance
+			j = j + 1
 		}
-
-		instances[i] = instance
 	}
 
-	return instances
+	// only return instances up to j
+	if j >= 1 {
+		fmt.Printf("linsun return instances %v\n", instances)
+		return instances[0:j]
+	} else {
+		return nil
+	}
+}
+
+// return nil if we cannot find container name == "application"
+func getApplicationContainerState(pod v1.Pod) cc_messages.LRPInstanceState {
+	containerStatuses := pod.Status.ContainerStatuses
+	for _, containerStatus := range containerStatuses {
+		if containerStatus.Name == "application" {
+			if containerStatus.State.Waiting != nil {
+				return cc_messages.LRPInstanceStateStarting
+			} else if containerStatus.State.Running != nil {
+				return cc_messages.LRPInstanceStateRunning
+			} else if containerStatus.State.Terminated != nil {
+				return cc_messages.LRPInstanceStateDown
+			} else {
+				return cc_messages.LRPInstanceStateUnknown
+			}
+		}
+	}
+
+	return ""
 }

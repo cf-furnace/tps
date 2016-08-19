@@ -22,9 +22,11 @@ type FakeNoaaClient struct {
 	CloseStub        func() error
 	closeMutex       sync.RWMutex
 	closeArgsForCall []struct{}
-	closeReturns struct {
+	closeReturns     struct {
 		result1 error
 	}
+	invocations      map[string][][]interface{}
+	invocationsMutex sync.RWMutex
 }
 
 func (fake *FakeNoaaClient) ContainerMetrics(appGuid string, authToken string) ([]*events.ContainerMetric, error) {
@@ -33,6 +35,7 @@ func (fake *FakeNoaaClient) ContainerMetrics(appGuid string, authToken string) (
 		appGuid   string
 		authToken string
 	}{appGuid, authToken})
+	fake.recordInvocation("ContainerMetrics", []interface{}{appGuid, authToken})
 	fake.containerMetricsMutex.Unlock()
 	if fake.ContainerMetricsStub != nil {
 		return fake.ContainerMetricsStub(appGuid, authToken)
@@ -64,6 +67,7 @@ func (fake *FakeNoaaClient) ContainerMetricsReturns(result1 []*events.ContainerM
 func (fake *FakeNoaaClient) Close() error {
 	fake.closeMutex.Lock()
 	fake.closeArgsForCall = append(fake.closeArgsForCall, struct{}{})
+	fake.recordInvocation("Close", []interface{}{})
 	fake.closeMutex.Unlock()
 	if fake.CloseStub != nil {
 		return fake.CloseStub()
@@ -83,6 +87,28 @@ func (fake *FakeNoaaClient) CloseReturns(result1 error) {
 	fake.closeReturns = struct {
 		result1 error
 	}{result1}
+}
+
+func (fake *FakeNoaaClient) Invocations() map[string][][]interface{} {
+	fake.invocationsMutex.RLock()
+	defer fake.invocationsMutex.RUnlock()
+	fake.containerMetricsMutex.RLock()
+	defer fake.containerMetricsMutex.RUnlock()
+	fake.closeMutex.RLock()
+	defer fake.closeMutex.RUnlock()
+	return fake.invocations
+}
+
+func (fake *FakeNoaaClient) recordInvocation(key string, args []interface{}) {
+	fake.invocationsMutex.Lock()
+	defer fake.invocationsMutex.Unlock()
+	if fake.invocations == nil {
+		fake.invocations = map[string][][]interface{}{}
+	}
+	if fake.invocations[key] == nil {
+		fake.invocations[key] = [][]interface{}{}
+	}
+	fake.invocations[key] = append(fake.invocations[key], args)
 }
 
 var _ lrpstats.NoaaClient = new(FakeNoaaClient)

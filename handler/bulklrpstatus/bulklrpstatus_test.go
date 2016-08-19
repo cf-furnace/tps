@@ -8,13 +8,16 @@ import (
 	"net/http/httptest"
 	"time"
 
-	"github.com/cloudfoundry-incubator/bbs/fake_bbs"
-	"github.com/cloudfoundry-incubator/bbs/models"
-	"github.com/cloudfoundry-incubator/nsync/recipebuilder"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/api/v1"
+
+	"github.com/cloudfoundry-incubator/nsync/helpers"
 	"github.com/cloudfoundry-incubator/runtime-schema/cc_messages"
 	"github.com/cloudfoundry-incubator/tps/handler/bulklrpstatus"
+	handlerfakes "github.com/cloudfoundry-incubator/tps/handler/handler_fakes"
+	"github.com/nu7hatch/gouuid"
 	"github.com/pivotal-golang/clock/fakeclock"
-	"github.com/pivotal-golang/lager"
 	"github.com/pivotal-golang/lager/lagertest"
 
 	. "github.com/onsi/ginkgo"
@@ -30,25 +33,118 @@ var _ = Describe("Bulk Status", func() {
 	const logGuid2 = "log-guid2"
 
 	var (
-		handler   http.Handler
-		response  *httptest.ResponseRecorder
-		request   *http.Request
-		bbsClient *fake_bbs.FakeClient
-		logger    *lagertest.TestLogger
-		fakeClock *fakeclock.FakeClock
+		handler           http.Handler
+		response          *httptest.ResponseRecorder
+		request           *http.Request
+		fakeKubeClient    *handlerfakes.FakeKubeClient
+		logger            *lagertest.TestLogger
+		fakeClock         *fakeclock.FakeClock
+		fakePod           *handlerfakes.FakePod
+		pod1              *v1.Pod
+		pod2              *v1.Pod
+		processGuid1      helpers.ProcessGuid
+		processGuid2      helpers.ProcessGuid
+		expectedSinceTime time.Time
+		actualSinceTime   time.Time
 	)
 
 	BeforeEach(func() {
 		var err error
 
-		bbsClient = new(fake_bbs.FakeClient)
+		fakeKubeClient = &handlerfakes.FakeKubeClient{}
 		logger = lagertest.NewTestLogger("test")
 		fakeClock = fakeclock.NewFakeClock(time.Date(2008, 8, 8, 8, 8, 8, 8, time.UTC))
-		handler = bulklrpstatus.NewHandler(bbsClient, fakeClock, 15, logger)
+		handler = bulklrpstatus.NewHandler(fakeKubeClient, fakeClock, 15, logger)
 		response = httptest.NewRecorder()
 		url := "/v1/bulk_actual_lrp_status"
 		request, err = http.NewRequest("GET", url, nil)
 		Expect(err).NotTo(HaveOccurred())
+
+		processGuid1, err = generateProcessGuid()
+		Expect(err).NotTo(HaveOccurred())
+
+		processGuid2, err = generateProcessGuid()
+		Expect(err).NotTo(HaveOccurred())
+
+		fakePod = &handlerfakes.FakePod{}
+		expectedSinceTime = fakeClock.Now()
+		actualSinceTime = fakeClock.Now()
+		fakeClock.Increment(5 * time.Second)
+		actualTime := unversioned.NewTime(actualSinceTime)
+
+		pod1 = &v1.Pod{
+			ObjectMeta: v1.ObjectMeta{
+				Name:              "pod-name1",
+				Namespace:         "namespace",
+				UID:               "1234-5677",
+				CreationTimestamp: unversioned.NewTime(actualSinceTime),
+				Labels: map[string]string{
+					"cloudfoundry.org/app-guid":     processGuid1.AppGuid.String(),
+					"cloudfoundry.org/space-guid":   "my-space-id",
+					"cloudfoundry.org/process-guid": processGuid1.ShortenedGuid(),
+					"cloudfoundry.org/domain":       cc_messages.AppLRPDomain,
+				},
+				Annotations: map[string]string{},
+			},
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
+					v1.Container{
+						Name:  "application",
+						Image: "cloudfoundry/cflinuxfs2:latest",
+					},
+				},
+			},
+			Status: v1.PodStatus{
+				StartTime: &actualTime,
+				ContainerStatuses: []v1.ContainerStatus{
+					v1.ContainerStatus{
+						Name: "application",
+						State: v1.ContainerState{
+							Running: &v1.ContainerStateRunning{},
+						},
+						Ready:        true,
+						RestartCount: int32(0),
+					},
+				},
+			},
+		}
+
+		pod2 = &v1.Pod{
+			ObjectMeta: v1.ObjectMeta{
+				Name:              "pod-name2",
+				Namespace:         "namespace",
+				UID:               "1234-5678",
+				CreationTimestamp: unversioned.NewTime(actualSinceTime),
+				Labels: map[string]string{
+					"cloudfoundry.org/app-guid":     processGuid2.AppGuid.String(),
+					"cloudfoundry.org/space-guid":   "my-space-id",
+					"cloudfoundry.org/process-guid": processGuid2.ShortenedGuid(),
+					"cloudfoundry.org/domain":       cc_messages.AppLRPDomain,
+				},
+				Annotations: map[string]string{},
+			},
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
+					v1.Container{
+						Name:  "application",
+						Image: "cloudfoundry/cflinuxfs2:latest",
+					},
+				},
+			},
+			Status: v1.PodStatus{
+				StartTime: &actualTime,
+				ContainerStatuses: []v1.ContainerStatus{
+					v1.ContainerStatus{
+						Name: "application",
+						State: v1.ContainerState{
+							Running: &v1.ContainerStateRunning{},
+						},
+						Ready:        true,
+						RestartCount: int32(0),
+					},
+				},
+			},
+		}
 	})
 
 	JustBeforeEach(func() {
@@ -81,80 +177,63 @@ var _ = Describe("Bulk Status", func() {
 
 	Describe("retrieves instance state for lrps specified", func() {
 		var (
-			expectedSinceTime, actualSinceTime int64
-			netInfo1, netInfo2                 models.ActualLRPNetInfo
+		//netInfo1, netInfo2                 models.ActualLRPNetInfo
 		)
 
 		BeforeEach(func() {
-			expectedSinceTime = fakeClock.Now().Unix()
-			actualSinceTime = fakeClock.Now().UnixNano()
-			fakeClock.Increment(5 * time.Second)
 
-			netInfo1 = models.NewActualLRPNetInfo(
-				"host",
-				models.NewPortMapping(5432, 7890),
-				models.NewPortMapping(1234, uint32(recipebuilder.DefaultPort)),
-			)
-			netInfo2 = models.NewActualLRPNetInfo(
-				"host2",
-				models.NewPortMapping(5432, 7890),
-				models.NewPortMapping(1234, uint32(recipebuilder.DefaultPort)),
-			)
+			// netInfo1 = models.NewActualLRPNetInfo(
+			// 	"host",
+			// 	models.NewPortMapping(5432, 7890),
+			// 	models.NewPortMapping(1234, uint32(recipebuilder.DefaultPort)),
+			// )
+			// netInfo2 = models.NewActualLRPNetInfo(
+			// 	"host2",
+			// 	models.NewPortMapping(5432, 7890),
+			// 	models.NewPortMapping(1234, uint32(recipebuilder.DefaultPort)),
+			// )
 
 			request.Header.Set("Authorization", authorization)
 
 			query := request.URL.Query()
-			query.Set("guids", fmt.Sprintf("%s,%s", guid1, guid2))
+			query.Set("guids", fmt.Sprintf("%s,%s", processGuid1.String(), processGuid2.String()))
 			request.URL.RawQuery = query.Encode()
 
-			bbsClient.ActualLRPGroupsByProcessGuidStub = func(logger lager.Logger, processGuid string) ([]*models.ActualLRPGroup, error) {
-				switch processGuid {
-
-				case guid1:
-					actualLRP := &models.ActualLRP{
-						ActualLRPKey:         models.NewActualLRPKey(processGuid, 5, "some-domain"),
-						ActualLRPInstanceKey: models.NewActualLRPInstanceKey("instanceId", "some-cell"),
-						ActualLRPNetInfo:     netInfo1,
-						State:                models.ActualLRPStateRunning,
-						Since:                actualSinceTime,
-					}
-					return []*models.ActualLRPGroup{{Instance: actualLRP}}, nil
-
-				case guid2:
-					actualLRP := &models.ActualLRP{
-						ActualLRPKey:         models.NewActualLRPKey(processGuid, 6, "some-domain"),
-						ActualLRPInstanceKey: models.NewActualLRPInstanceKey("instanceId", "some-cell"),
-						ActualLRPNetInfo:     netInfo2,
-						State:                models.ActualLRPStateRunning,
-						Since:                actualSinceTime,
-					}
-					return []*models.ActualLRPGroup{{Instance: actualLRP}}, nil
-
-				default:
-					return nil, errors.New("WHAT?")
+			fakeKubeClient.PodsReturns(fakePod)
+			fakePod.ListStub = func(opts api.ListOptions) (*v1.PodList, error) {
+				if opts.LabelSelector.String() == "cloudfoundry.org/process-guid="+processGuid1.ShortenedGuid() {
+					// return pod1
+					return &v1.PodList{
+						Items: []v1.Pod{*pod1},
+					}, nil
+				} else {
+					return &v1.PodList{
+						Items: []v1.Pod{*pod2},
+					}, nil
 				}
 			}
+
 		})
 
 		Context("when the LRPs have been running for a while", func() {
 			It("returns a map of status per index", func() {
 				expectedLRPInstance1 := cc_messages.LRPInstance{
-					ProcessGuid:  guid1,
-					InstanceGuid: "instanceId",
-					NetInfo:      netInfo1,
-					Index:        5,
-					State:        cc_messages.LRPInstanceStateRunning,
-					Since:        expectedSinceTime,
-					Uptime:       5,
+					ProcessGuid:  processGuid1.String(),
+					InstanceGuid: "1234-5677",
+					//NetInfo:      netInfo1,
+					Index:  0,
+					State:  cc_messages.LRPInstanceStateRunning,
+					Since:  expectedSinceTime.Unix(),
+					Uptime: 5,
 				}
 				expectedLRPInstance2 := cc_messages.LRPInstance{
-					ProcessGuid:  guid2,
-					InstanceGuid: "instanceId",
-					NetInfo:      netInfo2,
-					Index:        6,
-					State:        cc_messages.LRPInstanceStateRunning,
-					Since:        expectedSinceTime,
-					Uptime:       5,
+					ProcessGuid:  processGuid2.String(),
+					InstanceGuid: "1234-5678",
+					//NetInfo:      netInfo2,
+					Index:  0,
+					State:  cc_messages.LRPInstanceStateRunning,
+					Since:  expectedSinceTime.Unix(),
+					Uptime: 5,
 				}
 
 				status := make(map[string][]cc_messages.LRPInstance)
@@ -164,35 +243,24 @@ var _ = Describe("Bulk Status", func() {
 
 				err := json.Unmarshal(response.Body.Bytes(), &status)
 				Expect(err).NotTo(HaveOccurred())
-
-				Expect(status[guid1][0]).To(Equal(expectedLRPInstance1))
-				Expect(status[guid2][0]).To(Equal(expectedLRPInstance2))
+				fmt.Printf("status=%v", status)
+				Expect(status[processGuid1.String()][0]).To(Equal(expectedLRPInstance1))
+				Expect(status[processGuid2.String()][0]).To(Equal(expectedLRPInstance2))
 			})
 		})
 
 		Context("when fetching one of the actualLRPs fails", func() {
 			BeforeEach(func() {
-				bbsClient.ActualLRPGroupsByProcessGuidStub = func(logger lager.Logger, processGuid string) ([]*models.ActualLRPGroup, error) {
-					switch processGuid {
-
-					case guid1:
-						actualLRP := &models.ActualLRP{
-							ActualLRPKey:         models.NewActualLRPKey(processGuid, 5, "some-domain"),
-							ActualLRPInstanceKey: models.NewActualLRPInstanceKey("instanceId", "some-cell"),
-							ActualLRPNetInfo: models.NewActualLRPNetInfo(
-								"host",
-								models.NewPortMapping(5432, 7890),
-								models.NewPortMapping(1234, uint32(recipebuilder.DefaultPort)),
-							),
-							State: models.ActualLRPStateRunning,
-							Since: actualSinceTime,
-						}
-						return []*models.ActualLRPGroup{{Instance: actualLRP}}, nil
-
-					case guid2:
+				fakeKubeClient.PodsReturns(fakePod)
+				fakePod.ListStub = func(opts api.ListOptions) (*v1.PodList, error) {
+					if opts.LabelSelector.String() == "cloudfoundry.org/process-guid="+processGuid1.ShortenedGuid() {
+						// return pod1
+						return &v1.PodList{
+							Items: []v1.Pod{*pod1},
+						}, nil
+					} else if opts.LabelSelector.String() == "cloudfoundry.org/process-guid="+processGuid2.ShortenedGuid() {
 						return nil, errors.New("boom")
-
-					default:
+					} else {
 						return nil, errors.New("UNEXPECTED GUID YO")
 					}
 				}
@@ -214,3 +282,11 @@ var _ = Describe("Bulk Status", func() {
 		})
 	})
 })
+
+func generateProcessGuid() (helpers.ProcessGuid, error) {
+	appGuid, _ := uuid.NewV4()
+
+	appVersion, _ := uuid.NewV4()
+
+	return helpers.NewProcessGuid(appGuid.String() + "-" + appVersion.String())
+}

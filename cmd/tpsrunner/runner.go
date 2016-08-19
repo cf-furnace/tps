@@ -6,12 +6,15 @@ import (
 	"github.com/tedsuo/ifrit/ginkgomon"
 )
 
-func NewListener(bin, listenAddr, bbsAddress, trafficControllerURL, consulCluster string) *ginkgomon.Runner {
+func NewListener(bin, listenAddr, kubeCluster, kubeClientCert, kubeClientKey, kubeCACert, trafficControllerURL, consulCluster string) *ginkgomon.Runner {
 	return ginkgomon.New(ginkgomon.Config{
 		Name: "tps-listener",
 		Command: exec.Command(
 			bin,
-			"-bbsAddress", bbsAddress,
+			"-kubeCluster", kubeCluster,
+			"-kubeClientCert", kubeClientCert,
+			"-kubeClientKey", kubeClientKey,
+			"-kubeCACert", kubeCACert,
 			"-listenAddr", listenAddr,
 			"-trafficControllerURL", trafficControllerURL,
 			"-skipSSLVerification",

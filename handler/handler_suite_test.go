@@ -35,3 +35,8 @@ func newTestRequest(body interface{}) *http.Request {
 	Expect(err).NotTo(HaveOccurred())
 	return request
 }
+
+//go:generate counterfeiter -o handler_fakes/fake_replication_controller.go --fake-name FakeReplicationController ../../../../k8s.io/kubernetes/pkg/client/clientset_generated/release_1_3/typed/core/v1 ReplicationControllerInterface
+//go:generate counterfeiter -o handler_fakes/fake_pod.go --fake-name FakePod ../../../../k8s.io/kubernetes/pkg/client/clientset_generated/release_1_3/typed/core/v1 PodInterface
+//go:generate counterfeiter -o handler_fakes/fake_k8s_client.go --fake-name FakeKubeClient ../../../../k8s.io/kubernetes/pkg/client/clientset_generated/release_1_3/typed/core/v1 CoreInterface
+//go:generate counterfeiter -o handler_fakes/fake_namespace.go --fake-name FakeNamespace ../../../../k8s.io/kubernetes/pkg/client/clientset_generated/release_1_3/typed/core/v1 NamespaceInterface

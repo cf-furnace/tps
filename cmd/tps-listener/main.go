@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 
 	"github.com/cloudfoundry-incubator/cf-debug-server"
@@ -107,7 +106,8 @@ func main() {
 	initializeDropsonde(logger)
 	noaaClient := consumer.New(*trafficControllerURL, &tls.Config{InsecureSkipVerify: *skipSSLVerification}, nil)
 	defer noaaClient.Close()
-	apiHandler := initializeHandler(logger, noaaClient, *maxInFlightRequests, initializeK8sClient(logger).Core())
+	clientSet := initializeK8sClient(logger)
+	apiHandler := initializeHandler(logger, noaaClient, *maxInFlightRequests, clientSet)
 
 	consulClient, err := consuladapter.NewClientFromUrl(*consulCluster)
 	if err != nil {
@@ -150,8 +150,8 @@ func initializeDropsonde(logger lager.Logger) {
 	}
 }
 
-func initializeHandler(logger lager.Logger, noaaClient *consumer.Consumer, maxInFlight int, apiClient clientset.Interface) http.Handler {
-	apiHandler, err := handler.New(apiClient, noaaClient, maxInFlight, *bulkLRPStatusWorkers, logger)
+func initializeHandler(logger lager.Logger, noaaClient *consumer.Consumer, maxInFlight int, k8sClient clientset.Interface) http.Handler {
+	apiHandler, err := handler.New(k8sClient.Core(), noaaClient, maxInFlight, *bulkLRPStatusWorkers, logger)
 	if err != nil {
 		logger.Fatal("initialize-handler.failed", err)
 	}

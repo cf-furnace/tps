@@ -3,7 +3,6 @@ package handler
 import (
 	"net/http"
 
-	"github.com/cloudfoundry-incubator/bbs"
 	"github.com/cloudfoundry-incubator/tps"
 	"github.com/cloudfoundry-incubator/tps/handler/bulklrpstatus"
 	"github.com/cloudfoundry-incubator/tps/handler/lrpstats"
@@ -15,22 +14,22 @@ import (
 	v1core "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_3/typed/core/v1"
 )
 
-func New(apiClient v1core.CoreInterface, noaaClient lrpstats.NoaaClient, maxInFlight, bulkLRPStatusWorkers int, logger lager.Logger) (http.Handler, error) {
+func New(k8sClient v1core.CoreInterface, noaaClient lrpstats.NoaaClient, maxInFlight, bulkLRPStatusWorkers int, logger lager.Logger) (http.Handler, error) {
 	semaphore := make(chan struct{}, maxInFlight)
 	clock := clock.NewClock()
 
 	handlers := map[string]http.Handler{
 		tps.LRPStatus: tpsHandler{
 			semaphore:       semaphore,
-			delegateHandler: LogWrap(lrpstatus.NewHandler(apiClient, clock, logger), logger),
+			delegateHandler: LogWrap(lrpstatus.NewHandler(k8sClient, clock, logger), logger),
 		},
 		tps.LRPStats: tpsHandler{
 			semaphore:       semaphore,
-			delegateHandler: LogWrap(lrpstats.NewHandler(apiClient, noaaClient, clock, logger), logger),
+			delegateHandler: LogWrap(lrpstats.NewHandler(k8sClient, noaaClient, clock, logger), logger),
 		},
 		tps.BulkLRPStatus: tpsHandler{
 			semaphore:       semaphore,
-			delegateHandler: LogWrap(bulklrpstatus.NewHandler(apiClient, clock, bulkLRPStatusWorkers, logger), logger),
+			delegateHandler: LogWrap(bulklrpstatus.NewHandler(k8sClient, clock, bulkLRPStatusWorkers, logger), logger),
 		},
 	}
 

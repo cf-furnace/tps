@@ -3,25 +3,34 @@ package main_test
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
-	"mime/multipart"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
+
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/resource"
+	"k8s.io/kubernetes/pkg/api/v1"
+	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_3"
+	v1core "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_3/typed/core/v1"
+	"k8s.io/kubernetes/pkg/client/restclient"
+	"k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
+	"k8s.io/kubernetes/pkg/labels"
 
 	"github.com/cloudfoundry/sonde-go/events"
 	"github.com/gogo/protobuf/proto"
-	"github.com/hashicorp/consul/api"
+	consulapi "github.com/hashicorp/consul/api"
+	"github.com/nu7hatch/gouuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	"github.com/onsi/gomega/ghttp"
 	"github.com/tedsuo/ifrit/ginkgomon"
 	"github.com/tedsuo/rata"
 
-	"github.com/cloudfoundry-incubator/bbs/models"
+	"github.com/cloudfoundry-incubator/nsync/helpers"
 	"github.com/cloudfoundry-incubator/runtime-schema/cc_messages"
 	"github.com/cloudfoundry-incubator/tps"
+	tpshelpers "github.com/cloudfoundry-incubator/tps/helpers"
 )
 
 var _ = Describe("TPS-Listener", func() {
@@ -29,7 +38,13 @@ var _ = Describe("TPS-Listener", func() {
 		httpClient       *http.Client
 		requestGenerator *rata.RequestGenerator
 
-		desiredLRP, desiredLRP2 *models.DesiredLRP
+		err error
+
+		processGuid1     helpers.ProcessGuid
+		processGuid2     helpers.ProcessGuid
+		processGuid3     helpers.ProcessGuid
+		k8sClient        v1core.CoreInterface
+		defaultNamespace string
 	)
 
 	BeforeEach(func() {
@@ -37,20 +52,23 @@ var _ = Describe("TPS-Listener", func() {
 		httpClient = &http.Client{
 			Transport: &http.Transport{},
 		}
+		processGuid1, err = generateProcessGuid()
+		Expect(err).NotTo(HaveOccurred())
+		processGuid2, err = generateProcessGuid()
+		Expect(err).NotTo(HaveOccurred())
+		processGuid3, err = generateProcessGuid()
+		Expect(err).NotTo(HaveOccurred())
 
-		desiredLRP = &models.DesiredLRP{
-			Domain:      "some-domain",
-			ProcessGuid: "some-process-guid",
-			Instances:   3,
-			RootFs:      "some:rootfs",
-			MemoryMb:    1024,
-			DiskMb:      512,
-			LogGuid:     "some-process-guid",
-			Action: models.WrapAction(&models.RunAction{
-				User: "me",
-				Path: "ls",
-			}),
+		config := loadClientConfig()
+		k8sConfig, err := clientset.NewForConfig(config)
+		defaultNamespace = "default"
+
+		if err != nil {
+			logger.Fatal("Can't create kubernetes client", err)
 		}
+
+		k8sClient = k8sConfig.Core()
+
 	})
 
 	JustBeforeEach(func() {
@@ -62,6 +80,11 @@ var _ = Describe("TPS-Listener", func() {
 			listener.Signal(os.Kill)
 			Eventually(listener.Wait()).Should(Receive())
 		}
+		fmt.Printf("calling after each")
+
+		deleteReplicationController(k8sClient, defaultNamespace, processGuid1)
+		deleteReplicationController(k8sClient, defaultNamespace, processGuid2)
+		deleteReplicationController(k8sClient, defaultNamespace, processGuid3)
 	})
 
 	Describe("Initialization", func() {
@@ -69,7 +92,7 @@ var _ = Describe("TPS-Listener", func() {
 			services, err := consulRunner.NewClient().Agent().Services()
 			Expect(err).NotTo(HaveOccurred())
 			Expect(services).Should(HaveKeyWithValue("tps",
-				&api.AgentService{
+				&consulapi.AgentService{
 					Service: "tps",
 					ID:      "tps",
 					Port:    listenerPort,
@@ -80,7 +103,7 @@ var _ = Describe("TPS-Listener", func() {
 			checks, err := consulRunner.NewClient().Agent().Checks()
 			Expect(err).NotTo(HaveOccurred())
 			Expect(checks).Should(HaveKeyWithValue("service:tps",
-				&api.AgentCheck{
+				&consulapi.AgentCheck{
 					Node:        "0",
 					CheckID:     "service:tps",
 					Name:        "Service 'tps' check",
@@ -91,36 +114,50 @@ var _ = Describe("TPS-Listener", func() {
 		})
 	})
 
-	Describe("GET /v1/actual_lrps/:guid", func() {
-		Context("when the bbs is running", func() {
+	Describe("GET actual LRP for a given guid", func() {
+		Context("when the kubernetes is running", func() {
 			JustBeforeEach(func() {
-				fakeBBS.RouteToHandler("POST", "/v1/actual_lrp_groups/list_by_process_guid",
-					ghttp.RespondWithProto(200, &models.ActualLRPGroupsResponse{
-						ActualLrpGroups: []*models.ActualLRPGroup{
-							{Instance: &models.ActualLRP{ActualLRPKey: models.ActualLRPKey{ProcessGuid: "some-process-guid", Index: 0}, ActualLRPInstanceKey: models.ActualLRPInstanceKey{InstanceGuid: "some-instance-guid-0"}, State: models.ActualLRPStateClaimed}},
-							{Instance: &models.ActualLRP{ActualLRPKey: models.ActualLRPKey{ProcessGuid: "some-process-guid", Index: 1}, ActualLRPInstanceKey: models.ActualLRPInstanceKey{InstanceGuid: "some-instance-guid-1"}, State: models.ActualLRPStateRunning}},
-							{Instance: &models.ActualLRP{ActualLRPKey: models.ActualLRPKey{ProcessGuid: "some-process-guid", Index: 2}, State: models.ActualLRPStateUnclaimed}},
-						},
-					}),
-				)
+				newRC1 := generateReplicationController(processGuid1)
+				_, err := k8sClient.ReplicationControllers(newRC1.ObjectMeta.Namespace).Create(newRC1)
+				Expect(err).NotTo(HaveOccurred())
+
+				Eventually(replicationControllers(k8sClient, processGuid1.AppGuid.String()), 1*time.Minute).Should(HaveLen(1))
+				Eventually(pods(k8sClient, processGuid1.AppGuid.String()), 1*time.Minute).Should(HaveLen(3))
+
+				// wait till containers all reach running
+				time.Sleep(30 * time.Second)
 			})
 
 			It("reports the state of the given process guid's instances", func() {
 				getLRPs, err := requestGenerator.CreateRequest(
 					tps.LRPStatus,
-					rata.Params{"guid": "some-process-guid"},
+					rata.Params{"guid": processGuid1.String()},
 					nil,
 				)
 				Expect(err).NotTo(HaveOccurred())
-
 				response, err := httpClient.Do(getLRPs)
 				Expect(err).NotTo(HaveOccurred())
-
+				//time.Sleep(time.Second * 120)
 				var lrpInstances []cc_messages.LRPInstance
 				err = json.NewDecoder(response.Body).Decode(&lrpInstances)
 				Expect(err).NotTo(HaveOccurred())
 
+				podsList, err := k8sClient.Pods(defaultNamespace).List(api.ListOptions{
+					LabelSelector: labels.Set{"cloudfoundry.org/process-guid": processGuid1.ShortenedGuid()}.AsSelector(),
+				})
+
+				items := podsList.Items
+				items = tpshelpers.SortPods(items)
+				Expect(len(items)).To(Equal(3))
+
+				for _, pod := range items {
+					containerStatuses := pod.Status.ContainerStatuses
+					Eventually(containerStatuses).ShouldNot(BeNil())
+					Eventually(containerStatuses[0].State.Running).ShouldNot(BeNil())
+				}
+
 				Expect(lrpInstances).To(HaveLen(3))
+
 				for i, _ := range lrpInstances {
 					Expect(lrpInstances[i]).NotTo(BeZero())
 					lrpInstances[i].Since = 0
@@ -130,331 +167,43 @@ var _ = Describe("TPS-Listener", func() {
 				}
 
 				Expect(lrpInstances).To(ContainElement(cc_messages.LRPInstance{
-					ProcessGuid:  "some-process-guid",
-					InstanceGuid: "some-instance-guid-0",
+					ProcessGuid:  processGuid1.String(),
+					InstanceGuid: string(items[0].ObjectMeta.UID),
 					Index:        0,
-					State:        cc_messages.LRPInstanceStateStarting,
+					State:        cc_messages.LRPInstanceStateRunning,
 				}))
 
 				Expect(lrpInstances).To(ContainElement(cc_messages.LRPInstance{
-					ProcessGuid:  "some-process-guid",
-					InstanceGuid: "some-instance-guid-1",
+					ProcessGuid:  processGuid1.String(),
+					InstanceGuid: string(items[1].ObjectMeta.UID),
 					Index:        1,
 					State:        cc_messages.LRPInstanceStateRunning,
 				}))
 
 				Expect(lrpInstances).To(ContainElement(cc_messages.LRPInstance{
-					ProcessGuid:  "some-process-guid",
-					InstanceGuid: "",
+					ProcessGuid:  processGuid1.String(),
+					InstanceGuid: string(items[2].ObjectMeta.UID),
 					Index:        2,
-					State:        cc_messages.LRPInstanceStateStarting,
+					State:        cc_messages.LRPInstanceStateRunning,
 				}))
 			})
 		})
-
-		Context("when the bbs is not running", func() {
-			JustBeforeEach(func() {
-				fakeBBS.HTTPTestServer.Close()
-			})
-
-			It("returns 500", func() {
-				getLRPs, err := requestGenerator.CreateRequest(
-					tps.LRPStatus,
-					rata.Params{"guid": "some-process-guid"},
-					nil,
-				)
-				Expect(err).NotTo(HaveOccurred())
-
-				response, err := httpClient.Do(getLRPs)
-				Expect(err).NotTo(HaveOccurred())
-
-				Expect(response.StatusCode).To(Equal(http.StatusInternalServerError))
-			})
-		})
 	})
 
-	Describe("GET /v1/actual_lrps/:guid/stats", func() {
-		Context("when the bbs is running", func() {
-			var netInfo models.ActualLRPNetInfo
-
-			JustBeforeEach(func() {
-				netInfo = models.NewActualLRPNetInfo("1.2.3.4", models.NewPortMapping(65100, 8080))
-
-				fakeBBS.RouteToHandler("POST", "/v1/actual_lrp_groups/list_by_process_guid",
-					ghttp.RespondWithProto(200, &models.ActualLRPGroupsResponse{
-						ActualLrpGroups: []*models.ActualLRPGroup{
-							{Instance: &models.ActualLRP{ActualLRPKey: models.ActualLRPKey{ProcessGuid: "some-process-guid", Index: 0}, ActualLRPInstanceKey: models.ActualLRPInstanceKey{InstanceGuid: "some-instance-guid-0"}, State: models.ActualLRPStateClaimed}},
-							{Instance: &models.ActualLRP{ActualLRPKey: models.ActualLRPKey{ProcessGuid: "some-process-guid", Index: 1}, ActualLRPInstanceKey: models.ActualLRPInstanceKey{InstanceGuid: "some-instance-guid-1"}, State: models.ActualLRPStateRunning, ActualLRPNetInfo: netInfo}},
-							{Instance: &models.ActualLRP{ActualLRPKey: models.ActualLRPKey{ProcessGuid: "some-process-guid", Index: 2}, State: models.ActualLRPStateUnclaimed}},
-						},
-					}),
-				)
-			})
-
-			Context("when a DesiredLRP is not found", func() {
-				BeforeEach(func() {
-					fakeBBS.RouteToHandler("POST", "/v1/desired_lrps/get_by_process_guid.r1",
-						ghttp.RespondWithProto(200, &models.DesiredLRPResponse{
-							Error: models.ErrResourceNotFound,
-						}),
-					)
-				})
-
-				It("returns a NotFound", func() {
-					getLRPStats, err := requestGenerator.CreateRequest(
-						tps.LRPStats,
-						rata.Params{"guid": "some-bogus-guid"},
-						nil,
-					)
-					Expect(err).ToNot(HaveOccurred())
-					getLRPStats.Header.Add("Authorization", "I can do this.")
-
-					response, err := httpClient.Do(getLRPStats)
-					Expect(err).ToNot(HaveOccurred())
-					Expect(response.StatusCode).To(Equal(http.StatusNotFound))
-				})
-			})
-
-			Context("when the traffic controller is running", func() {
-				BeforeEach(func() {
-					message1 := marshalMessage(createContainerMetric("some-process-guid", 0, 3.0, 1024, 2048, 0))
-					message2 := marshalMessage(createContainerMetric("some-process-guid", 1, 4.0, 1024, 2048, 0))
-					message3 := marshalMessage(createContainerMetric("some-process-guid", 2, 5.0, 1024, 2048, 0))
-
-					messages := map[string][][]byte{}
-					messages["some-process-guid"] = [][]byte{message1, message2, message3}
-					fakeTrafficController.RouteToHandler("GET", "/apps/some-process-guid/containermetrics",
-						func(rw http.ResponseWriter, r *http.Request) {
-							mp := multipart.NewWriter(rw)
-							defer mp.Close()
-
-							guid := "some-process-guid"
-
-							rw.Header().Set("Content-Type", `multipart/x-protobuf; boundary=`+mp.Boundary())
-
-							for _, msg := range messages[guid] {
-								partWriter, _ := mp.CreatePart(nil)
-								partWriter.Write(msg)
-							}
-						},
-					)
-
-					fakeBBS.RouteToHandler("POST", "/v1/desired_lrps/get_by_process_guid.r1",
-						ghttp.CombineHandlers(
-							ghttp.VerifyProtoRepresenting(&models.DesiredLRPByProcessGuidRequest{ProcessGuid: "some-process-guid"}),
-							ghttp.RespondWithProto(200, &models.DesiredLRPResponse{
-								DesiredLrp: desiredLRP,
-							}),
-						),
-					)
-				})
-
-				It("reports the state of the given process guid's instances", func() {
-					getLRPStats, err := requestGenerator.CreateRequest(
-						tps.LRPStats,
-						rata.Params{"guid": "some-process-guid"},
-						nil,
-					)
-					Expect(err).NotTo(HaveOccurred())
-					getLRPStats.Header.Add("Authorization", "I can do this.")
-
-					response, err := httpClient.Do(getLRPStats)
-					Expect(err).NotTo(HaveOccurred())
-					Expect(response.StatusCode).To(Equal(http.StatusOK))
-
-					var lrpInstances []cc_messages.LRPInstance
-					err = json.NewDecoder(response.Body).Decode(&lrpInstances)
-					Expect(err).NotTo(HaveOccurred())
-
-					Expect(lrpInstances).To(HaveLen(3))
-					zeroTime := time.Unix(0, 0)
-					for i, _ := range lrpInstances {
-						Expect(lrpInstances[i].Stats.Time).NotTo(BeZero())
-						lrpInstances[i].Stats.Time = zeroTime
-
-						Expect(lrpInstances[i]).NotTo(BeZero())
-						lrpInstances[i].Since = 0
-
-						Eventually(lrpInstances[i]).ShouldNot(BeZero())
-						lrpInstances[i].Uptime = 0
-					}
-
-					Expect(lrpInstances).To(ContainElement(cc_messages.LRPInstance{
-						ProcessGuid:  "some-process-guid",
-						InstanceGuid: "some-instance-guid-0",
-						Index:        0,
-						State:        cc_messages.LRPInstanceStateStarting,
-						Stats: &cc_messages.LRPInstanceStats{
-							Time:          zeroTime,
-							CpuPercentage: 0.03,
-							MemoryBytes:   1024,
-							DiskBytes:     2048,
-						},
-					}))
-
-					Expect(lrpInstances).To(ContainElement(cc_messages.LRPInstance{
-						ProcessGuid:  "some-process-guid",
-						InstanceGuid: "some-instance-guid-1",
-						Index:        1,
-						State:        cc_messages.LRPInstanceStateRunning,
-						Host:         "1.2.3.4",
-						Port:         65100,
-						NetInfo:      netInfo,
-						Stats: &cc_messages.LRPInstanceStats{
-							Time:          zeroTime,
-							CpuPercentage: 0.04,
-							MemoryBytes:   1024,
-							DiskBytes:     2048,
-						},
-					}))
-
-					Expect(lrpInstances).To(ContainElement(cc_messages.LRPInstance{
-						ProcessGuid:  "some-process-guid",
-						InstanceGuid: "",
-						Index:        2,
-						State:        cc_messages.LRPInstanceStateStarting,
-						Stats: &cc_messages.LRPInstanceStats{
-							Time:          zeroTime,
-							CpuPercentage: 0.05,
-							MemoryBytes:   1024,
-							DiskBytes:     2048,
-						},
-					}))
-				})
-			})
-
-			Context("when the traffic controller is not running", func() {
-				BeforeEach(func() {
-					fakeBBS.RouteToHandler("POST", "/v1/desired_lrps/get_by_process_guid.r1",
-						ghttp.CombineHandlers(
-							ghttp.VerifyProtoRepresenting(&models.DesiredLRPByProcessGuidRequest{ProcessGuid: "some-process-guid"}),
-							ghttp.RespondWithProto(200, &models.DesiredLRPResponse{
-								DesiredLrp: desiredLRP,
-							}),
-						),
-					)
-					fakeTrafficController.HTTPTestServer.Close()
-				})
-
-				It("reports the status with nil stats", func() {
-					getLRPStats, err := requestGenerator.CreateRequest(
-						tps.LRPStats,
-						rata.Params{"guid": "some-process-guid"},
-						nil,
-					)
-					Expect(err).NotTo(HaveOccurred())
-					getLRPStats.Header.Add("Authorization", "I can do this.")
-
-					response, err := httpClient.Do(getLRPStats)
-					Expect(err).NotTo(HaveOccurred())
-					Expect(response.StatusCode).To(Equal(http.StatusOK))
-
-					var lrpInstances []cc_messages.LRPInstance
-					err = json.NewDecoder(response.Body).Decode(&lrpInstances)
-					Expect(err).NotTo(HaveOccurred())
-
-					Expect(lrpInstances).To(HaveLen(3))
-
-					for _, instance := range lrpInstances {
-						Expect(instance.Stats).To(BeNil())
-					}
-				})
-			})
-		})
-
-		Context("when the bbs is not running", func() {
-			JustBeforeEach(func() {
-				fakeBBS.HTTPTestServer.Close()
-			})
-
-			It("returns internal server error", func() {
-				getLRPs, err := requestGenerator.CreateRequest(
-					tps.LRPStats,
-					rata.Params{"guid": "some-process-guid"},
-					nil,
-				)
-				Expect(err).NotTo(HaveOccurred())
-				getLRPs.Header.Add("Authorization", "I can do this.")
-
-				response, err := httpClient.Do(getLRPs)
-				Expect(err).NotTo(HaveOccurred())
-
-				Expect(response.StatusCode).To(Equal(http.StatusInternalServerError))
-			})
-		})
-	})
-
-	Describe("GET /v1/bulk_actual_lrp_status", func() {
-		var netInfo models.ActualLRPNetInfo
-
+	Describe("get actual lrp for all guids when kubernetes is running", func() {
 		JustBeforeEach(func() {
-			desiredLRP2 = &models.DesiredLRP{
-				Domain:      "some-domain",
-				ProcessGuid: "some-other-process-guid",
-				Instances:   3,
-				RootFs:      "some:rootfs",
-				MemoryMb:    1024,
-				DiskMb:      512,
-				LogGuid:     "some-other-log-guid",
-				Action: models.WrapAction(&models.RunAction{
-					User: "me",
-					Path: "ls",
-				}),
-			}
-
-			fakeBBS.RouteToHandler("POST", "/v1/desired_lrps/get_by_process_guid.r1",
-				func(w http.ResponseWriter, r *http.Request) {
-					body, err := ioutil.ReadAll(r.Body)
-					Expect(err).NotTo(HaveOccurred())
-					r.Body.Close()
-
-					req := &models.DesiredLRPByProcessGuidRequest{}
-					err = proto.Unmarshal(body, req)
-					Expect(err).NotTo(HaveOccurred(), "Failed to unmarshal protobuf")
-
-					if req.ProcessGuid == "some-process-guid" {
-						ghttp.RespondWithProto(200, &models.DesiredLRPResponse{
-							DesiredLrp: desiredLRP,
-						})(w, nil)
-					} else if req.ProcessGuid == "some-other-process-guid" {
-						ghttp.RespondWithProto(200, &models.DesiredLRPResponse{
-							DesiredLrp: desiredLRP2,
-						})(w, nil)
-					}
-				},
-			)
-
-			netInfo = models.NewActualLRPNetInfo("1.2.3.4", models.NewPortMapping(65100, 8080))
-
-			fakeBBS.RouteToHandler("POST", "/v1/actual_lrp_groups/list_by_process_guid",
-				func(w http.ResponseWriter, r *http.Request) {
-					body, err := ioutil.ReadAll(r.Body)
-					Expect(err).NotTo(HaveOccurred())
-					r.Body.Close()
-
-					req := &models.ActualLRPGroupsByProcessGuidRequest{}
-					err = proto.Unmarshal(body, req)
-					Expect(err).NotTo(HaveOccurred(), "Failed to unmarshal protobuf")
-
-					if req.ProcessGuid == "some-process-guid" {
-						ghttp.RespondWithProto(200, &models.ActualLRPGroupsResponse{
-							ActualLrpGroups: []*models.ActualLRPGroup{
-								{Instance: &models.ActualLRP{ActualLRPKey: models.ActualLRPKey{ProcessGuid: "some-process-guid", Index: 0}, ActualLRPInstanceKey: models.ActualLRPInstanceKey{InstanceGuid: "some-instance-guid-0"}, State: models.ActualLRPStateClaimed}},
-								{Instance: &models.ActualLRP{ActualLRPKey: models.ActualLRPKey{ProcessGuid: "some-process-guid", Index: 1}, ActualLRPInstanceKey: models.ActualLRPInstanceKey{InstanceGuid: "some-instance-guid-1"}, State: models.ActualLRPStateRunning, ActualLRPNetInfo: netInfo}},
-								{Instance: &models.ActualLRP{ActualLRPKey: models.ActualLRPKey{ProcessGuid: "some-process-guid", Index: 2}, State: models.ActualLRPStateUnclaimed}},
-							},
-						})(w, nil)
-					} else if req.ProcessGuid == "some-other-process-guid" {
-						ghttp.RespondWithProto(200, &models.ActualLRPGroupsResponse{
-							ActualLrpGroups: []*models.ActualLRPGroup{
-								{Instance: &models.ActualLRP{ActualLRPKey: models.ActualLRPKey{ProcessGuid: "some-other-process-guid", Index: 0}, ActualLRPInstanceKey: models.ActualLRPInstanceKey{InstanceGuid: "some-instance-guid-0"}, State: models.ActualLRPStateClaimed}},
-								{Instance: &models.ActualLRP{ActualLRPKey: models.ActualLRPKey{ProcessGuid: "some-other-process-guid", Index: 1}, ActualLRPInstanceKey: models.ActualLRPInstanceKey{InstanceGuid: "some-instance-guid-1"}, State: models.ActualLRPStateRunning, ActualLRPNetInfo: netInfo}},
-								{Instance: &models.ActualLRP{ActualLRPKey: models.ActualLRPKey{ProcessGuid: "some-other-process-guid", Index: 2}, State: models.ActualLRPStateUnclaimed}},
-							},
-						})(w, nil)
-					}
-				},
-			)
+			newRC1 := generateReplicationController(processGuid2)
+			_, err = k8sClient.ReplicationControllers(newRC1.ObjectMeta.Namespace).Create(newRC1)
+			Expect(err).NotTo(HaveOccurred())
+			newRC2 := generateReplicationController(processGuid3)
+			_, err = k8sClient.ReplicationControllers(newRC2.ObjectMeta.Namespace).Create(newRC2)
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(replicationControllers(k8sClient, processGuid2.AppGuid.String()), 1*time.Minute).Should(HaveLen(1))
+			Eventually(replicationControllers(k8sClient, processGuid3.AppGuid.String()), 1*time.Minute).Should(HaveLen(1))
+			Eventually(pods(k8sClient, processGuid2.AppGuid.String()), 1*time.Minute).Should(HaveLen(3))
+			Eventually(pods(k8sClient, processGuid3.AppGuid.String()), 1*time.Minute).Should(HaveLen(3))
+			// wait till containers all reach running
+			time.Sleep(60 * time.Second)
 		})
 
 		It("reports the status for all the process guids supplied", func() {
@@ -467,7 +216,7 @@ var _ = Describe("TPS-Listener", func() {
 			getLRPStatus.Header.Add("Authorization", "I can do this.")
 
 			query := getLRPStatus.URL.Query()
-			query.Set("guids", "some-process-guid,some-other-process-guid")
+			query.Set("guids", processGuid2.String()+","+processGuid3.String())
 			getLRPStatus.URL.RawQuery = query.Encode()
 
 			response, err := httpClient.Do(getLRPStatus)
@@ -480,6 +229,18 @@ var _ = Describe("TPS-Listener", func() {
 
 			Expect(lrpInstanceStatus).To(HaveLen(2))
 			for guid, instances := range lrpInstanceStatus {
+				pg, err := helpers.NewProcessGuid(guid)
+				Expect(err).To(BeNil())
+				podsList, err := k8sClient.Pods(defaultNamespace).List(api.ListOptions{
+					LabelSelector: labels.Set{"cloudfoundry.org/process-guid": pg.ShortenedGuid()}.AsSelector(),
+				})
+				Expect(err).To(BeNil())
+
+				items := podsList.Items
+				items = tpshelpers.SortPods(items)
+
+				Expect(len(items)).To(Equal(3))
+
 				for i, _ := range instances {
 					Expect(instances[i]).NotTo(BeZero())
 					instances[i].Since = 0
@@ -490,24 +251,24 @@ var _ = Describe("TPS-Listener", func() {
 
 				Expect(instances).To(ContainElement(cc_messages.LRPInstance{
 					ProcessGuid:  guid,
-					InstanceGuid: "some-instance-guid-0",
+					InstanceGuid: string(items[0].ObjectMeta.UID),
 					Index:        0,
-					State:        cc_messages.LRPInstanceStateStarting,
-				}))
-
-				Expect(instances).To(ContainElement(cc_messages.LRPInstance{
-					ProcessGuid:  guid,
-					InstanceGuid: "some-instance-guid-1",
-					Index:        1,
-					NetInfo:      netInfo,
 					State:        cc_messages.LRPInstanceStateRunning,
 				}))
 
 				Expect(instances).To(ContainElement(cc_messages.LRPInstance{
 					ProcessGuid:  guid,
-					InstanceGuid: "",
+					InstanceGuid: string(items[1].ObjectMeta.UID),
+					Index:        1,
+					//	NetInfo:      netInfo,
+					State: cc_messages.LRPInstanceStateRunning,
+				}))
+
+				Expect(instances).To(ContainElement(cc_messages.LRPInstance{
+					ProcessGuid:  guid,
+					InstanceGuid: string(items[2].ObjectMeta.UID),
 					Index:        2,
-					State:        cc_messages.LRPInstanceStateStarting,
+					State:        cc_messages.LRPInstanceStateRunning,
 				}))
 			}
 		})
@@ -542,4 +303,134 @@ func marshalMessage(message *events.Envelope) []byte {
 	}
 
 	return data
+}
+
+func generateProcessGuid() (helpers.ProcessGuid, error) {
+	appGuid, _ := uuid.NewV4()
+
+	appVersion, _ := uuid.NewV4()
+
+	return helpers.NewProcessGuid(appGuid.String() + "-" + appVersion.String())
+}
+
+func loadClientConfig() *restclient.Config {
+	home := os.Getenv("HOME")
+	config, err := clientcmd.LoadFromFile(filepath.Join(home, ".kube", "config"))
+	Expect(err).NotTo(HaveOccurred())
+
+	context := config.Contexts[config.CurrentContext]
+
+	clientConfig := &restclient.Config{
+		Host:     config.Clusters[context.Cluster].Server,
+		Username: config.AuthInfos[context.AuthInfo].Username,
+		Password: config.AuthInfos[context.AuthInfo].Password,
+		Insecure: config.Clusters[context.Cluster].InsecureSkipTLSVerify,
+		TLSClientConfig: restclient.TLSClientConfig{
+			CertFile: config.AuthInfos[context.AuthInfo].ClientCertificate,
+			KeyFile:  config.AuthInfos[context.AuthInfo].ClientKey,
+			CAFile:   config.Clusters[context.Cluster].CertificateAuthority,
+		},
+	}
+	return clientConfig
+}
+
+func generateReplicationController(pg helpers.ProcessGuid) *v1.ReplicationController {
+	return &v1.ReplicationController{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      pg.ShortenedGuid(),
+			Namespace: "default",
+			Labels: map[string]string{
+				"cloudfoundry.org/process-guid": pg.ShortenedGuid(),
+				"cloudfoundry.org/domain":       cc_messages.AppLRPDomain,
+				"cloudfoundry.org/app-guid":     pg.AppGuid.String(),
+			},
+			Annotations: map[string]string{
+				"cloudfoundry.org/log-guid":      "the-log-guid",
+				"cloudfoundry.org/metrics-guid":  "the-metrics-guid",
+				"cloudfoundry.org/storage-space": "storage-space",
+				"cloudfoundry.org/etag":          "current-etag",
+			},
+		},
+		Spec: v1.ReplicationControllerSpec{
+			Replicas: helpers.Int32Ptr(3),
+			Selector: map[string]string{
+				"cloudfoundry.org/process-guid": pg.ShortenedGuid(),
+			},
+			Template: &v1.PodTemplateSpec{
+				ObjectMeta: v1.ObjectMeta{
+					Labels: map[string]string{
+						"cloudfoundry.org/app-guid":     pg.AppGuid.String(),
+						"cloudfoundry.org/process-guid": pg.ShortenedGuid(),
+						"cloudfoundry.org/domain":       cc_messages.AppLRPDomain,
+					},
+				},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{{
+						Name:    "application",
+						Image:   "busybox",
+						Command: []string{"sleep", "3600"},
+						Resources: v1.ResourceRequirements{
+							Limits: v1.ResourceList{
+								v1.ResourceCPU:                   resource.MustParse("100m"),
+								v1.ResourceMemory:                resource.MustParse(fmt.Sprintf("%dMi", 256)),
+								"cloudfoundry.org/storage-space": resource.MustParse(fmt.Sprintf("%dMi", 1024)),
+							},
+						},
+					}},
+				},
+			},
+		},
+	}
+}
+
+func replicationControllers(client v1core.CoreInterface, appGuid string) func() []string {
+	return func() []string {
+		rcList, err := client.ReplicationControllers(api.NamespaceAll).List(api.ListOptions{
+			LabelSelector: labels.Set{"cloudfoundry.org/app-guid": appGuid}.AsSelector(),
+		})
+		if err != nil {
+			fmt.Fprintf(GinkgoWriter, "List replication controller failed: %s\n", err.Error())
+			return nil
+		}
+
+		result := []string{}
+		for _, rc := range rcList.Items {
+			result = append(result, rc.Name)
+		}
+
+		return result
+	}
+}
+
+func pods(client v1core.CoreInterface, appGuid string) func() []string {
+	return func() []string {
+		podList, err := client.Pods(api.NamespaceAll).List(api.ListOptions{
+			LabelSelector: labels.Set{"cloudfoundry.org/app-guid": appGuid}.AsSelector(),
+		})
+		if err != nil {
+			fmt.Fprintf(GinkgoWriter, "List pods failed: %s\n", err.Error())
+			return nil
+		}
+
+		result := []string{}
+		for _, pod := range podList.Items {
+			result = append(result, pod.Name)
+		}
+
+		return result
+	}
+}
+
+func deleteReplicationController(k8sClient v1core.CoreInterface, namespace string, pg helpers.ProcessGuid) {
+	k8sClient.ReplicationControllers(namespace).Delete(pg.ShortenedGuid(), nil)
+	k8sClient.Pods(namespace).Delete(pg.ShortenedGuid(), nil)
+
+	podsList, _ := k8sClient.Pods(namespace).List(api.ListOptions{
+		LabelSelector: labels.Set{"cloudfoundry.org/process-guid": pg.ShortenedGuid()}.AsSelector(),
+	})
+
+	items := podsList.Items
+	for _, pod := range items {
+		k8sClient.Pods(namespace).Delete(pod.ObjectMeta.Name, nil)
+	}
 }

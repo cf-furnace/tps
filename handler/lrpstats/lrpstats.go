@@ -2,16 +2,22 @@ package lrpstats
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
-	"github.com/cloudfoundry-incubator/bbs"
 	"github.com/cloudfoundry-incubator/bbs/models"
+	"github.com/cloudfoundry-incubator/nsync/helpers"
 	"github.com/cloudfoundry-incubator/nsync/recipebuilder"
 	"github.com/cloudfoundry-incubator/runtime-schema/cc_messages"
 	"github.com/cloudfoundry-incubator/tps/handler/lrpstatus"
 	"github.com/cloudfoundry/sonde-go/events"
 	"github.com/pivotal-golang/clock"
 	"github.com/pivotal-golang/lager"
+	kubeerrors "k8s.io/kubernetes/pkg/api/errors"
+
+	"k8s.io/kubernetes/pkg/api"
+	v1core "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_3/typed/core/v1"
+	"k8s.io/kubernetes/pkg/labels"
 )
 
 //go:generate counterfeiter -o fakes/fake_noaaclient.go . NoaaClient
@@ -21,14 +27,14 @@ type NoaaClient interface {
 }
 
 type handler struct {
-	bbsClient  bbs.Client
+	k8sClient  v1core.CoreInterface
 	noaaClient NoaaClient
 	clock      clock.Clock
 	logger     lager.Logger
 }
 
-func NewHandler(bbsClient bbs.Client, noaaClient NoaaClient, clk clock.Clock, logger lager.Logger) http.Handler {
-	return &handler{bbsClient: bbsClient, noaaClient: noaaClient, clock: clk, logger: logger}
+func NewHandler(k8sClient v1core.CoreInterface, noaaClient NoaaClient, clk clock.Clock, logger lager.Logger) http.Handler {
+	return &handler{k8sClient: k8sClient, noaaClient: noaaClient, clock: clk, logger: logger}
 }
 
 func (handler *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -39,41 +45,52 @@ func (handler *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	guid := r.FormValue(":guid")
+
+	logger := handler.logger.Session("lrp-stats", lager.Data{"process-guid": guid})
+
 	if guid == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	logger := handler.logger.Session("lrp-stats", lager.Data{"process-guid": guid})
-
-	logger.Info("fetching-desired-lrp")
-	desiredLRP, err := handler.bbsClient.DesiredLRPByProcessGuid(logger, guid)
+	pg, err := helpers.NewProcessGuid(guid)
 	if err != nil {
-		logger.Error("fetching-desired-lrp-failed", err)
-		switch models.ConvertError(err).Type {
-		case models.Error_ResourceNotFound:
-			w.WriteHeader(http.StatusNotFound)
-		default:
-			w.WriteHeader(http.StatusInternalServerError)
-		}
+		logger.Error("invalid-process-guid", err)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
 	logger.Info("fetching-actual-lrp-info")
-	actualLRPs, err := handler.bbsClient.ActualLRPGroupsByProcessGuid(logger, guid)
+	actualLRPs, err := handler.k8sClient.Pods(api.NamespaceAll).List(api.ListOptions{
+		LabelSelector: labels.Set{"cloudfoundry.org/process-guid": pg.ShortenedGuid()}.AsSelector(),
+	})
+
+	if actualLRPs != nil && len(actualLRPs.Items) == 0 && responseCodeFromError(err) == http.StatusNotFound {
+		logger.Info("fetching-actual-lrp-not-found")
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
 	if err != nil {
 		logger.Error("fetching-actual-lrp-info-failed", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
+	if actualLRPs == nil || len(actualLRPs.Items) == 0 {
+		logger.Error("fetching-actual-lrp-info-failed", errors.New("invalid-actual-lrp"))
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	logGuid := actualLRPs.Items[0].ObjectMeta.Annotations["cloudfoundry.org/log-guid"]
 	logger.Info("fetching-container-metrics", lager.Data{
-		"log-guid": desiredLRP.LogGuid,
+		"log-guid": logGuid,
 	})
-	metrics, err := handler.noaaClient.ContainerMetrics(desiredLRP.LogGuid, authorization)
+	metrics, err := handler.noaaClient.ContainerMetrics(logGuid, authorization)
 	if err != nil {
 		handler.logger.Error("fetching-container-metrics-failed", err, lager.Data{
-			"log-guid": desiredLRP.LogGuid,
+			"log-guid": logGuid,
 		})
 	}
 
@@ -89,13 +106,7 @@ func (handler *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	instances := lrpstatus.LRPInstances(actualLRPs,
-		func(instance *cc_messages.LRPInstance, actual *models.ActualLRP) {
-			instance.Host = actual.Address
-			instance.Port = getDefaultPort(actual.Ports)
-			stats := metricsByInstanceIndex[uint(actual.Index)]
-			instance.Stats = stats
-		},
+	instances := lrpstatus.LRPInstances(actualLRPs.Items,
 		handler.clock,
 	)
 
@@ -127,4 +138,18 @@ func getDefaultPort(mappings []*models.PortMapping) uint16 {
 	}
 
 	return 0
+}
+
+func responseCodeFromError(err error) int {
+	switch err := err.(type) {
+	case *kubeerrors.StatusError:
+		switch err.ErrStatus.Code {
+		case http.StatusNotFound:
+			return http.StatusNotFound
+		default:
+			return http.StatusInternalServerError
+		}
+	default:
+		return http.StatusInternalServerError
+	}
 }

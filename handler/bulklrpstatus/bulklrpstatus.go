@@ -7,27 +7,29 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/cloudfoundry-incubator/bbs"
-	"github.com/cloudfoundry-incubator/bbs/models"
+	"github.com/cloudfoundry-incubator/nsync/helpers"
 	"github.com/cloudfoundry-incubator/runtime-schema/cc_messages"
 	"github.com/cloudfoundry-incubator/tps/handler/lrpstatus"
 	"github.com/cloudfoundry/gunk/workpool"
 	"github.com/pivotal-golang/clock"
 	"github.com/pivotal-golang/lager"
+	"k8s.io/kubernetes/pkg/api"
+	v1core "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_3/typed/core/v1"
+	"k8s.io/kubernetes/pkg/labels"
 )
 
 var processGuidPattern = regexp.MustCompile(`^([a-zA-Z0-9_-]+,)*[a-zA-Z0-9_-]+$`)
 
 type handler struct {
-	bbsClient                 bbs.Client
+	k8sClient                 v1core.CoreInterface
 	clock                     clock.Clock
 	logger                    lager.Logger
 	bulkLRPStatusWorkPoolSize int
 }
 
-func NewHandler(bbsClient bbs.Client, clk clock.Clock, bulkLRPStatusWorkPoolSize int, logger lager.Logger) http.Handler {
+func NewHandler(k8sClient v1core.CoreInterface, clk clock.Clock, bulkLRPStatusWorkPoolSize int, logger lager.Logger) http.Handler {
 	return &handler{
-		bbsClient: bbsClient,
+		k8sClient: k8sClient,
 		clock:     clk,
 		bulkLRPStatusWorkPoolSize: bulkLRPStatusWorkPoolSize,
 		logger: logger,
@@ -77,21 +79,28 @@ func (handler *handler) getStatusForLRPWorkFunction(logger lager.Logger, process
 		logger = logger.Session("fetching-actual-lrps-info", lager.Data{"process-guid": processGuid})
 		logger.Info("start")
 		defer logger.Info("complete")
-		actualLRPGroups, err := handler.bbsClient.ActualLRPGroupsByProcessGuid(logger, processGuid)
+
+		pg, err := helpers.NewProcessGuid(processGuid)
+		if err != nil {
+			logger.Error("invalid-process-guid", err)
+			return
+		}
+		actualLRPGroups, err := handler.k8sClient.Pods(api.NamespaceAll).List(api.ListOptions{
+			LabelSelector: labels.Set{"cloudfoundry.org/process-guid": pg.ShortenedGuid()}.AsSelector(),
+		})
 		if err != nil {
 			logger.Error("fetching-actual-lrps-info-failed", err)
 			return
 		}
 
-		instances := lrpstatus.LRPInstances(actualLRPGroups,
-			func(instance *cc_messages.LRPInstance, actual *models.ActualLRP) {
-				instance.Details = actual.PlacementError
-			},
+		instances := lrpstatus.LRPInstances(actualLRPGroups.Items,
 			handler.clock,
 		)
 
 		statusLock.Lock()
-		statusBundle[processGuid] = instances
+		if instances != nil {
+			statusBundle[processGuid] = instances
+		}
 		statusLock.Unlock()
 	}
 }
