@@ -423,7 +423,6 @@ func pods(client v1core.CoreInterface, appGuid string) func() []string {
 
 func deleteReplicationController(k8sClient v1core.CoreInterface, namespace string, pg helpers.ProcessGuid) {
 	k8sClient.ReplicationControllers(namespace).Delete(pg.ShortenedGuid(), nil)
-	k8sClient.Pods(namespace).Delete(pg.ShortenedGuid(), nil)
 
 	podsList, _ := k8sClient.Pods(namespace).List(api.ListOptions{
 		LabelSelector: labels.Set{"cloudfoundry.org/process-guid": pg.ShortenedGuid()}.AsSelector(),
