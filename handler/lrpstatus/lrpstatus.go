@@ -2,7 +2,6 @@ package lrpstatus
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 
 	"github.com/cloudfoundry-incubator/nsync/helpers"
@@ -103,7 +102,6 @@ func LRPInstances(
 
 	// only return instances up to j
 	if j >= 1 {
-		fmt.Printf("linsun return instances %v\n", instances)
 		return instances[0:j]
 	} else {
 		return nil
